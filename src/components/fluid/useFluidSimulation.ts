@@ -5,14 +5,37 @@ import * as THREE from 'three'
 export const FLUID_CONFIG = {
   simResolution: 128,
   dyeResolution: 1024,
-  splatRadius: 0.0022,
-  splatForce: 6000,
-  curl: 32,
+  velocityRadius: 0.0064,
+  dyeRadius: 0.0068,
+  splatForce: 3400,
+  curl: 8,
   pressureIterations: 20,
-  pressure: 0.8,
-  densityDissipation: 1.4,
-  velocityDissipation: 0.35,
-  dyeIntensity: 0.4,
+  pressureDissipation: 0.8,
+  densityDissipation: 1.45,
+  velocityDissipation: 1.15,
+  dyeFloor: 0.0005,
+  // Vivid progressive HSV color cycling.
+  colorUpdateInterval: 0.18,
+  colorLerpTime: 0.08,
+  dyeIntensity: 0.11,
+}
+
+export const BLOOM_CONFIG = { levels: 4, threshold: 0.16, softKnee: 0.85 }
+
+function hsvToRgb(h: number, s: number, v: number): [number, number, number] {
+  const i = Math.floor(h * 6)
+  const f = h * 6 - i
+  const p = v * (1 - s)
+  const q = v * (1 - f * s)
+  const t = v * (1 - (1 - f) * s)
+  switch (((i % 6) + 6) % 6) {
+    case 0: return [v, t, p]
+    case 1: return [q, v, p]
+    case 2: return [p, v, t]
+    case 3: return [p, q, v]
+    case 4: return [t, p, v]
+    default: return [v, p, q]
+  }
 }
 
 const VERT = /* glsl */ `
@@ -39,7 +62,8 @@ const FRAG = {
     void main() {
       vec2 p = vUv - point; p.x *= aspectRatio;
       vec3 splat = exp(-dot(p, p) / radius) * color;
-      gl_FragColor = vec4(texture2D(uTarget, vUv).xyz + splat, 1.0);
+      vec3 base = texture2D(uTarget, vUv).xyz;
+      gl_FragColor = vec4(base + splat, 1.0);
     }`,
   curl: HEAD + /* glsl */ `
     uniform sampler2D uVelocity;
@@ -91,11 +115,46 @@ const FRAG = {
     }`,
   advection: HEAD + /* glsl */ `
     uniform sampler2D uVelocity; uniform sampler2D uSource; uniform vec2 velTexel;
-    uniform float dt; uniform float dissipation;
+    uniform float dt; uniform float dissipation; uniform float floorValue;
     void main() {
       vec2 coord = vUv - dt * texture2D(uVelocity, vUv).xy * velTexel;
       vec4 result = texture2D(uSource, coord);
-      gl_FragColor = result / (1.0 + dissipation * dt);
+      vec4 decayed = result / (1.0 + dissipation * dt);
+      // Linear floor (dye only) so faint haze vanishes completely.
+      // Applied to magnitude so signed velocity is never clamped.
+      gl_FragColor = sign(decayed) * max(abs(decayed) - vec4(floorValue), vec4(0.0));
+    }`,
+  bloomPrefilter: HEAD + /* glsl */ `
+    uniform sampler2D uSource; uniform vec3 curve; uniform float threshold;
+    void main() {
+      vec3 c = max(texture2D(uSource, vUv).rgb, vec3(0.0));
+      float br = max(c.r, max(c.g, c.b));
+      float rq = clamp(br - curve.x, 0.0, curve.y);
+      rq = curve.z * rq * rq;
+      c *= max(rq, br - threshold) / max(br, 1e-4);
+      gl_FragColor = vec4(c, 1.0);
+    }`,
+  bloomDown: HEAD + /* glsl */ `
+    uniform sampler2D uSource; uniform vec2 srcTexel;
+    void main() {
+      vec3 s = texture2D(uSource, vUv + srcTexel * vec2(-1.0, -1.0)).rgb
+             + texture2D(uSource, vUv + srcTexel * vec2( 1.0, -1.0)).rgb
+             + texture2D(uSource, vUv + srcTexel * vec2(-1.0,  1.0)).rgb
+             + texture2D(uSource, vUv + srcTexel * vec2( 1.0,  1.0)).rgb;
+      gl_FragColor = vec4(s * 0.25, 1.0);
+    }`,
+  bloomUp: HEAD + /* glsl */ `
+    uniform sampler2D uLow; uniform sampler2D uBase; uniform vec2 lowTexel; uniform float gain;
+    void main() {
+      vec3 s = texture2D(uLow, vUv + lowTexel * vec2(-1.0, 0.0)).rgb
+             + texture2D(uLow, vUv + lowTexel * vec2( 1.0, 0.0)).rgb
+             + texture2D(uLow, vUv + lowTexel * vec2(0.0,  1.0)).rgb
+             + texture2D(uLow, vUv + lowTexel * vec2(0.0, -1.0)).rgb
+             + 2.0 * texture2D(uLow, vUv + lowTexel * vec2(-0.7, -0.7)).rgb
+             + 2.0 * texture2D(uLow, vUv + lowTexel * vec2( 0.7,  0.7)).rgb
+             + 2.0 * texture2D(uLow, vUv + lowTexel * vec2(-0.7,  0.7)).rgb
+             + 2.0 * texture2D(uLow, vUv + lowTexel * vec2( 0.7, -0.7)).rgb;
+      gl_FragColor = vec4(texture2D(uBase, vUv).rgb + s * (gain / 12.0), 1.0);
     }`,
 }
 
@@ -144,6 +203,8 @@ interface Sim {
   divergence: THREE.WebGLRenderTarget
   curl: THREE.WebGLRenderTarget
   geometry: THREE.BufferGeometry
+  bloomDown: THREE.WebGLRenderTarget[]
+  bloomUp: THREE.WebGLRenderTarget[]
 }
 
 /**
@@ -163,7 +224,11 @@ export function useFluidSimulation() {
   const simRef = useRef<Sim | null>(null)
   const fallback = useRef<THREE.Texture | null>(null)
   const pointer = useRef({ x: 0.5, y: 0.5, dx: 0, dy: 0, moved: false, has: false })
-  const hue = useRef(0)
+  const hue = useRef(Math.random())
+  const colorTimer = useRef(0)
+  const currentColor = useRef(new THREE.Vector3())
+  const targetColor = useRef(new THREE.Vector3(...hsvToRgb(hue.current, 1, 1)))
+  const prevDelta = useRef({ x: 0, y: 0 })
 
   useEffect(() => {
     const onMove = (e: PointerEvent) => {
@@ -196,6 +261,13 @@ export function useFluidSimulation() {
         depthWrite: false,
       })
     })
+    const bloomDown: THREE.WebGLRenderTarget[] = []
+    for (let i = 0; i < BLOOM_CONFIG.levels; i++) {
+      const d = 2 ** (i + 1)
+      bloomDown.push(makeRT(Math.max(2, Math.floor(dyeW / d)), Math.max(2, Math.floor(dyeH / d))))
+    }
+    // bloomUp[i] accumulates level i with the blurred result of level i + 1.
+    const bloomUp = bloomDown.slice(0, -1).map((t) => makeRT(t.width, t.height))
     const quad = new THREE.Mesh(geometry, mats.splat)
     quad.frustumCulled = false
     const scene = new THREE.Scene()
@@ -211,6 +283,8 @@ export function useFluidSimulation() {
       divergence: makeRT(simW, simH),
       curl: makeRT(simW, simH),
       geometry,
+      bloomDown,
+      bloomUp,
     }
     simRef.current = sim
     return () => {
@@ -220,6 +294,8 @@ export function useFluidSimulation() {
       sim.pressure.dispose()
       sim.divergence.dispose()
       sim.curl.dispose()
+      bloomDown.forEach((t) => t.dispose())
+      bloomUp.forEach((t) => t.dispose())
       geometry.dispose()
       Object.values(mats).forEach((m) => m.dispose())
     }
@@ -235,7 +311,7 @@ export function useFluidSimulation() {
   useFrame((_state, delta) => {
     const sim = simRef.current
     if (!sim) return
-    const dt = Math.min(delta, 0.0166)
+    const dt = Math.min(delta, 0.033)
     const { mats, quad, scene, camera } = sim
     const cfg = FLUID_CONFIG
 
@@ -260,37 +336,64 @@ export function useFluidSimulation() {
     const prs = sim.pressure
     const vt = vel.texel
 
+    // Progressive analogous-plus hue step.
+    colorTimer.current += dt
+    if (colorTimer.current >= cfg.colorUpdateInterval) {
+      colorTimer.current %= cfg.colorUpdateInterval
+      hue.current = (hue.current + 0.14 + Math.random() * 0.06) % 1.0
+      targetColor.current.set(...hsvToRgb(hue.current, 1, 1))
+    }
+    currentColor.current.lerp(targetColor.current, Math.min(1, dt / cfg.colorLerpTime))
+
     const p = pointer.current
     if (p.moved) {
-      hue.current = (hue.current + 0.004 + Math.hypot(p.dx, p.dy) * 0.5) % 1
-      const c = new THREE.Color().setHSL(hue.current, 1, 0.5, THREE.LinearSRGBColorSpace)
-      const point = new THREE.Vector2(p.x, p.y)
-      run('splat', vel.write, vt, {
-        uTarget: vel.read.texture,
-        aspectRatio: aspect,
-        point,
-        radius: cfg.splatRadius,
-        color: new THREE.Vector3(p.dx * cfg.splatForce, p.dy * cfg.splatForce, 0),
-      })
-      vel.swap()
-      run('splat', den.write, den.texel, {
-        uTarget: den.read.texture,
-        aspectRatio: aspect,
-        point,
-        radius: cfg.splatRadius,
-        color: new THREE.Vector3(c.r, c.g, c.b).multiplyScalar(cfg.dyeIntensity),
-      })
-      den.swap()
+      const c = currentColor.current
+      // Light exponential smoothing of pointer delta to suppress trackpad jitter.
+      const pd = prevDelta.current
+      const dx = 0.65 * p.dx + 0.35 * pd.x
+      const dy = 0.65 * p.dy + 0.35 * pd.y
+      pd.x = dx
+      pd.y = dy
+      const distance = Math.hypot(p.dx * aspect, p.dy)
+      const steps = Math.min(24, Math.max(1, Math.ceil(distance / 0.003)))
+      const sx = p.x - p.dx
+      const sy = p.y - p.dy
+      const k = cfg.dyeIntensity / steps
+      for (let i = 1; i <= steps; i++) {
+        const t = i / steps
+        const point = new THREE.Vector2(sx + p.dx * t, sy + p.dy * t)
+        run('splat', vel.write, vt, {
+          uTarget: vel.read.texture,
+          aspectRatio: aspect,
+          point,
+          radius: cfg.velocityRadius,
+          color: new THREE.Vector3((dx / steps) * cfg.splatForce, (dy / steps) * cfg.splatForce, 0),
+        })
+        vel.swap()
+        run('splat', den.write, den.texel, {
+          uTarget: den.read.texture,
+          aspectRatio: aspect,
+          point,
+          radius: cfg.dyeRadius,
+          color: new THREE.Vector3(c.x * k, c.y * k, c.z * k),
+        })
+        den.swap()
+      }
       p.dx = 0
       p.dy = 0
       p.moved = false
+    } else {
+      prevDelta.current.x = 0
+      prevDelta.current.y = 0
     }
 
-    run('curl', sim.curl, vt, { uVelocity: vel.read.texture })
-    run('vorticity', vel.write, vt, { uVelocity: vel.read.texture, uCurl: sim.curl.texture, curl: cfg.curl, dt })
-    vel.swap()
+    if (cfg.curl > 0) {
+      run('curl', sim.curl, vt, { uVelocity: vel.read.texture })
+      run('vorticity', vel.write, vt, { uVelocity: vel.read.texture, uCurl: sim.curl.texture, curl: cfg.curl, dt })
+      vel.swap()
+    }
     run('divergence', sim.divergence, vt, { uVelocity: vel.read.texture })
-    run('clear', prs.write, vt, { uTexture: prs.read.texture, value: cfg.pressure })
+    run('clear', prs.write, vt, { uTexture: prs.read.texture, value: cfg.pressureDissipation })
     prs.swap()
     for (let i = 0; i < cfg.pressureIterations; i++) {
       run('pressure', prs.write, vt, { uPressure: prs.read.texture, uDivergence: sim.divergence.texture })
@@ -304,6 +407,7 @@ export function useFluidSimulation() {
       velTexel: vt,
       dt,
       dissipation: cfg.velocityDissipation,
+      floorValue: 0,
     })
     vel.swap()
     run('advection', den.write, den.texel, {
@@ -312,8 +416,33 @@ export function useFluidSimulation() {
       velTexel: vt,
       dt,
       dissipation: cfg.densityDissipation,
+      floorValue: cfg.dyeFloor,
     })
     den.swap()
+
+    // Multi-pass bloom: soft-knee bright pass, downsample chain, progressive upsample.
+    const { threshold, softKnee } = BLOOM_CONFIG
+    const knee = threshold * softKnee + 1e-4
+    const down = sim.bloomDown
+    const up = sim.bloomUp
+    const tex = (t: THREE.WebGLRenderTarget) => new THREE.Vector2(1 / t.width, 1 / t.height)
+    run('bloomPrefilter', down[0], den.texel, {
+      uSource: den.read.texture,
+      curve: new THREE.Vector3(threshold - knee, knee * 2, 0.25 / knee),
+      threshold,
+    })
+    for (let i = 1; i < down.length; i++) {
+      run('bloomDown', down[i], den.texel, { uSource: down[i - 1].texture, srcTexel: tex(down[i - 1]) })
+    }
+    for (let i = down.length - 2; i >= 0; i--) {
+      const low = i === down.length - 2 ? down[i + 1] : up[i + 1]
+      run('bloomUp', up[i], den.texel, {
+        uLow: low.texture,
+        uBase: down[i].texture,
+        lowTexel: tex(low),
+        gain: 0.8,
+      })
+    }
 
     gl.setRenderTarget(prevTarget)
     gl.autoClear = prevAuto
@@ -325,5 +454,11 @@ export function useFluidSimulation() {
     if (!fallback.current) fallback.current = new THREE.Texture()
     return fallback.current
   }
-  return { getDensity, aspect }
+  const getBloom = (): THREE.Texture => {
+    const sim = simRef.current
+    if (sim) return sim.bloomUp[0].texture
+    if (!fallback.current) fallback.current = new THREE.Texture()
+    return fallback.current
+  }
+  return { getDensity, getBloom, aspect }
 }
